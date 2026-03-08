@@ -17,6 +17,10 @@ export class PromoBannersService {
     this.logger.setContext('PromoBannersService');
   }
 
+  /**
+   * List banners that are currently visible: now is within [visibleFrom, visibleTo].
+   * If visibleFrom is in the future, the banner is not returned until that time.
+   */
   async listPublic(params: {
     placement?: string;
     device?: string;
