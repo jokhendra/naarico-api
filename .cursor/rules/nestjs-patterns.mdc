@@ -1,0 +1,286 @@
+---
+globs: *.ts,*.js
+---
+
+# NestJS Patterns and Conventions
+
+## 🎯 Module Structure Standards
+
+### Module Definition Pattern
+```typescript
+@Module({
+  imports: [
+    // External modules first
+    ConfigModule,
+    PrismaModule,
+    // Then internal modules
+    CommonModule,
+    RelatedModule,
+  ],
+  controllers: [ModuleController],
+  providers: [
+    ModuleService,
+    // Shared services
+    PrismaService,
+    AppLogger,
+  ],
+  exports: [ModuleService], // Export for other modules
+})
+export class ModuleModule {}
+```
+
+### Controller Patterns
+```typescript
+@ApiTags('module-name')
+@Controller('module-name')
+export class ModuleController {
+  constructor(private readonly moduleService: ModuleService) {}
+
+  @Get()
+  @Public() // For public endpoints
+  @UseInterceptors(CacheInterceptor)
+  @CacheTTL(300)
+  @ApiOperation({ summary: 'Get all items' })
+  @ApiResponse({ status: 200, type: ResponseDto })
+  async findAll(@Query() filterDto: FilterDto): Promise<ResponseDto> {
+    return this.moduleService.findAll(filterDto);
+  }
+
+  @Post()
+  @UseGuards(AuthGuard('jwt'), RolesGuard)
+  @Roles(Role.ADMIN, Role.SELLER)
+  @ApiOperation({ summary: 'Create new item' })
+  @ApiBody({ type: CreateDto })
+  @ApiResponse({ status: 201, type: ResponseDto })
+  async create(@Body() createDto: CreateDto): Promise<ResponseDto> {
+    return this.moduleService.create(createDto);
+  }
+}
+```
+
+### Service Patterns
+```typescript
+@Injectable()
+export class ModuleService {
+  constructor(
+    private readonly prismaService: PrismaService,
+    private readonly logger: AppLogger,
+  ) {
+    this.logger.setContext('ModuleService');
+  }
+
+  async findAll(filterDto: FilterDto): Promise<ResponseDto> {
+    try {
+      // Implementation
+      this.logger.log('Operation completed successfully');
+      return result;
+    } catch (error) {
+      if (error instanceof NotFoundException) {
+        throw error;
+      }
+      this.logger.error(`Error message: ${error.message}`, error.stack);
+      throw new InternalServerErrorException('Operation failed');
+    }
+  }
+}
+```
+
+## 🔐 Authentication & Authorization
+
+### Guard Usage
+```typescript
+// Public endpoint (no auth required)
+@Public()
+@Get('public')
+
+// Protected endpoint (auth required)
+@UseGuards(AuthGuard('jwt'))
+@Get('protected')
+
+// Role-based access
+@UseGuards(AuthGuard('jwt'), RolesGuard)
+@Roles(Role.ADMIN, Role.SELLER)
+@Get('admin-only')
+
+// Ownership-based access
+@UseGuards(AuthGuard('jwt'), RolesGuard, OwnershipGuard)
+@Roles(Role.ADMIN, Role.SELLER)
+@ResourceType('product')
+@Get('owned-resource')
+```
+
+### Seller Context Pattern
+```typescript
+// Use seller context decorator for multi-tenancy
+async create(
+  @Body() createDto: CreateDto,
+  @GetSellerContext() sellerContext: SellerContext,
+): Promise<ResponseDto> {
+  // Handle admin vs seller logic
+  if (sellerContext.isAdmin) {
+    // Admin can specify sellerId
+    return this.service.create(createDto, createDto.sellerId);
+  } else {
+    // Seller uses their own ID
+    return this.service.create(createDto, sellerContext.sellerId);
+  }
+}
+```
+
+## 📝 API Documentation
+
+### Swagger Decorators
+```typescript
+@ApiTags('products')
+@ApiOperation({ summary: 'Get product by ID' })
+@ApiParam({ name: 'id', description: 'Product ID', type: String })
+@ApiResponse({ 
+  status: 200, 
+  description: 'Product found', 
+  type: ProductResponseDto 
+})
+@ApiNotFoundResponse({ description: 'Product not found' })
+@ApiBearerAuth('JWT-auth')
+```
+
+### Response DTOs
+```typescript
+export class ProductResponseDto {
+  @ApiProperty({ description: 'Product ID', example: 'uuid' })
+  id: string;
+
+  @ApiProperty({ description: 'Product title', example: 'iPhone 13' })
+  title: string;
+
+  @ApiPropertyOptional({ description: 'Product price', example: 999.99 })
+  price?: number;
+}
+```
+
+## 🚀 Performance & Caching
+
+### Caching Strategy
+```typescript
+// Cache frequently accessed data
+@UseInterceptors(CacheInterceptor)
+@CacheTTL(300) // 5 minutes
+@Get('cached-endpoint')
+
+// Cache search results
+@UseInterceptors(CacheInterceptor)
+@CacheTTL(600) // 10 minutes for search
+@Get('search')
+```
+
+### Pagination Pattern
+```typescript
+export class PaginatedResponseDto<T> {
+  @ApiProperty({ description: 'Array of items' })
+  data: T[];
+
+  @ApiProperty({ description: 'Total count' })
+  total: number;
+
+  @ApiProperty({ description: 'Current page' })
+  page: number;
+
+  @ApiProperty({ description: 'Items per page' })
+  limit: number;
+
+  @ApiProperty({ description: 'Total pages' })
+  totalPages: number;
+
+  @ApiProperty({ description: 'Has next page' })
+  hasNextPage: boolean;
+
+  @ApiProperty({ description: 'Has previous page' })
+  hasPreviousPage: boolean;
+}
+```
+
+## 🔄 Error Handling
+
+### Exception Patterns
+```typescript
+// Use specific exceptions with error codes
+throw new NotFoundException(`Product with ID ${id} not found`);
+throw new ConflictException(`Product with slug '${slug}' already exists`);
+throw new BadRequestException('Invalid input data');
+throw new ForbiddenException('You can only update your own products');
+
+// Custom exceptions with error codes
+throw new CustomHttpException(
+  'Custom error message',
+  HttpStatus.BAD_REQUEST,
+  ErrorCode.INVALID_INPUT
+);
+```
+
+### Service Error Handling
+```typescript
+try {
+  // Business logic
+  return result;
+} catch (error) {
+  // Re-throw known exceptions
+  if (error instanceof NotFoundException || 
+      error instanceof ConflictException) {
+    throw error;
+  }
+  
+  // Log and wrap unknown errors
+  this.logger.error(`Operation failed: ${error.message}`, error.stack);
+  throw new InternalServerErrorException('Operation failed');
+}
+```
+
+## 📦 Dependency Injection
+
+### Service Dependencies
+```typescript
+@Injectable()
+export class ProductService {
+  constructor(
+    private readonly prismaService: PrismaService,
+    private readonly logger: AppLogger,
+    private readonly specificationsService: SpecificationsService,
+  ) {
+    this.logger.setContext('ProductService');
+  }
+}
+```
+
+### Module Exports
+```typescript
+@Module({
+  providers: [ProductService],
+  exports: [ProductService], // Export for other modules
+})
+export class ProductsModule {}
+```
+
+## 🎨 Code Style
+
+### Naming Conventions
+- **Files**: kebab-case (`product-service.ts`)
+- **Classes**: PascalCase (`ProductService`)
+- **Methods**: camelCase (`findAllProducts`)
+- **Constants**: UPPER_SNAKE_CASE (`MAX_RETRY_COUNT`)
+- **Interfaces**: PascalCase with 'I' prefix (`IProductService`)
+
+### Import Organization
+```typescript
+// 1. Node modules
+import { Injectable } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
+
+// 2. Internal modules
+import { PrismaService } from '../../common/prisma.service';
+import { AppLogger } from '../../common/services/logger.service';
+
+// 3. Local imports
+import { CreateProductDto } from './dto/create-product.dto';
+import { ProductResponseDto } from './dto/product-response.dto';
+```
+
+This ensures consistent, maintainable, and scalable NestJS code following enterprise patterns.

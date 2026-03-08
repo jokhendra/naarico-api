@@ -1,0 +1,559 @@
+---
+globs: *prisma*.ts,*service*.ts,schema.prisma
+---
+
+# Database and Prisma Patterns
+
+## 🗄️ Prisma Service Pattern
+
+### Base Prisma Service
+```typescript
+@Injectable()
+export class PrismaService extends PrismaClient implements OnModuleInit, OnModuleDestroy {
+  constructor(private readonly configService: ConfigService) {
+    super({
+      datasources: {
+        db: {
+          url: configService.get<string>('DATABASE_URL'),
+        },
+      },
+      log: ['query', 'info', 'warn', 'error'],
+    });
+  }
+
+  async onModuleInit() {
+    await this.$connect();
+  }
+
+  async onModuleDestroy() {
+    await this.$disconnect();
+  }
+
+  // Health check
+  async isHealthy(): Promise<boolean> {
+    try {
+      await this.$queryRaw`SELECT 1`;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+```
+
+### Service with Prisma Integration
+```typescript
+@Injectable()
+export class ProductService {
+  constructor(
+    private readonly prismaService: PrismaService,
+    private readonly logger: AppLogger,
+  ) {
+    this.logger.setContext('ProductService');
+  }
+
+  async findAll(filterDto: ProductFilterDto): Promise<ProductResponseDto[]> {
+    const where = this.buildWhereClause(filterDto);
+    
+    const products = await this.prismaService.product.findMany({
+      where,
+      include: {
+        brand: true,
+        category: true,
+        images: {
+          orderBy: { position: 'asc' },
+        },
+        variants: true,
+        tags: {
+          include: { tag: true },
+        },
+      },
+      orderBy: this.buildOrderBy(filterDto),
+      skip: this.calculateSkip(filterDto),
+      take: filterDto.limit,
+    });
+
+    return products.map(product => this.transformProductToDto(product));
+  }
+
+  private buildWhereClause(filterDto: ProductFilterDto): Prisma.ProductWhereInput {
+    const where: Prisma.ProductWhereInput = {
+      isActive: true,
+    };
+
+    if (filterDto.search) {
+      where.OR = [
+        { title: { contains: filterDto.search, mode: 'insensitive' } },
+        { description: { contains: filterDto.search, mode: 'insensitive' } },
+      ];
+    }
+
+    if (filterDto.categoryId) {
+      where.categoryId = filterDto.categoryId;
+    }
+
+    if (filterDto.minPrice !== undefined || filterDto.maxPrice !== undefined) {
+      where.price = {};
+      if (filterDto.minPrice !== undefined) {
+        where.price.gte = filterDto.minPrice;
+      }
+      if (filterDto.maxPrice !== undefined) {
+        where.price.lte = filterDto.maxPrice;
+      }
+    }
+
+    return where;
+  }
+}
+```
+
+## 🔄 Transaction Patterns
+
+### Simple Transaction
+```typescript
+async createProductWithVariants(createDto: CreateProductDto): Promise<ProductResponseDto> {
+  try {
+    const product = await this.prismaService.$transaction(async (prisma) => {
+      // Create product
+      const newProduct = await prisma.product.create({
+        data: {
+          title: createDto.title,
+          price: createDto.price,
+          // ... other fields
+        },
+      });
+
+      // Create variants
+      if (createDto.variants && createDto.variants.length > 0) {
+        await Promise.all(
+          createDto.variants.map((variant) =>
+            prisma.productVariant.create({
+              data: {
+                productId: newProduct.id,
+                variantName: variant.variantName,
+                price: variant.price,
+                stockQuantity: variant.stockQuantity,
+              },
+            }),
+          ),
+        );
+      }
+
+      return newProduct;
+    });
+
+    this.logger.log(`Created product with variants: ${product.id}`);
+    return this.transformProductToDto(product);
+  } catch (error) {
+    this.logger.error(`Error creating product: ${error.message}`, error.stack);
+    throw new InternalServerErrorException('Failed to create product');
+  }
+}
+```
+
+### Complex Transaction with Error Handling
+```typescript
+async processOrder(orderId: string): Promise<OrderResponseDto> {
+  try {
+    const result = await this.prismaService.$transaction(async (prisma) => {
+      // 1. Get order with items
+      const order = await prisma.order.findUnique({
+        where: { id: orderId },
+        include: {
+          items: {
+            include: { product: true, variant: true },
+          },
+        },
+      });
+
+      if (!order) {
+        throw new NotFoundException(`Order ${orderId} not found`);
+      }
+
+      if (order.status !== 'PENDING') {
+        throw new BadRequestException('Order is not in pending status');
+      }
+
+      // 2. Check inventory for all items
+      for (const item of order.items) {
+        const inventory = await prisma.inventory.findFirst({
+          where: {
+            productId: item.productId,
+            variantId: item.variantId || null,
+          },
+        });
+
+        if (!inventory || inventory.stockQuantity < item.quantity) {
+          throw new BadRequestException(
+            `Insufficient stock for product ${item.product.title}`,
+          );
+        }
+      }
+
+      // 3. Reserve inventory
+      for (const item of order.items) {
+        await prisma.inventory.updateMany({
+          where: {
+            productId: item.productId,
+            variantId: item.variantId || null,
+          },
+          data: {
+            stockQuantity: { decrement: item.quantity },
+            reservedQuantity: { increment: item.quantity },
+          },
+        });
+
+        // Log inventory change
+        await prisma.inventoryLog.create({
+          data: {
+            productId: item.productId,
+            variantId: item.variantId,
+            changeType: 'RESERVE',
+            quantityChanged: -item.quantity,
+            note: `Reserved for order ${orderId}`,
+          },
+        });
+      }
+
+      // 4. Update order status
+      const updatedOrder = await prisma.order.update({
+        where: { id: orderId },
+        data: {
+          status: 'CONFIRMED',
+          confirmedAt: new Date(),
+        },
+        include: {
+          items: {
+            include: { product: true, variant: true },
+          },
+        },
+      });
+
+      return updatedOrder;
+    });
+
+    this.logger.log(`Order ${orderId} processed successfully`);
+    return this.transformOrderToDto(result);
+  } catch (error) {
+    if (error instanceof NotFoundException || error instanceof BadRequestException) {
+      throw error;
+    }
+    this.logger.error(`Error processing order ${orderId}: ${error.message}`, error.stack);
+    throw new InternalServerErrorException('Failed to process order');
+  }
+}
+```
+
+## 📊 Query Optimization Patterns
+
+### Efficient Pagination
+```typescript
+async findProductsPaginated(filterDto: ProductFilterDto): Promise<PaginatedProductResponseDto> {
+  const { page = 1, limit = 10 } = filterDto;
+  const skip = (page - 1) * limit;
+
+  // Execute count and data queries in parallel
+  const [products, total] = await Promise.all([
+    this.prismaService.product.findMany({
+      where: this.buildWhereClause(filterDto),
+      include: {
+        brand: { select: { id: true, name: true } }, // Only select needed fields
+        category: { select: { id: true, name: true, slug: true } },
+        images: {
+          select: { id: true, imageUrl: true, altText: true },
+          orderBy: { position: 'asc' },
+          take: 1, // Only first image for list view
+        },
+        _count: { select: { variants: true, reviews: true } }, // Count relations
+      },
+      orderBy: this.buildOrderBy(filterDto),
+      skip,
+      take: limit,
+    }),
+    this.prismaService.product.count({
+      where: this.buildWhereClause(filterDto),
+    }),
+  ]);
+
+  return {
+    data: products.map(product => this.transformProductToDto(product)),
+    total,
+    page,
+    limit,
+    totalPages: Math.ceil(total / limit),
+    hasNextPage: page < Math.ceil(total / limit),
+    hasPreviousPage: page > 1,
+  };
+}
+```
+
+### Selective Field Loading
+```typescript
+// For list views - minimal data
+async findProductList(): Promise<ProductListDto[]> {
+  return this.prismaService.product.findMany({
+    select: {
+      id: true,
+      title: true,
+      slug: true,
+      price: true,
+      discountPrice: true,
+      stockQuantity: true,
+      images: {
+        select: { imageUrl: true },
+        where: { position: 0 }, // Only main image
+      },
+      brand: { select: { name: true } },
+      category: { select: { name: true } },
+    },
+    where: { isActive: true },
+    orderBy: { createdAt: 'desc' },
+  });
+}
+
+// For detail views - full data
+async findProductDetail(id: string): Promise<ProductDetailDto> {
+  return this.prismaService.product.findUnique({
+    where: { id },
+    include: {
+      brand: true,
+      category: true,
+      subCategory: true,
+      images: { orderBy: { position: 'asc' } },
+      variants: true,
+      tags: { include: { tag: true } },
+      reviews: {
+        include: {
+          user: { select: { firstName: true, lastName: true } },
+        },
+        orderBy: { createdAt: 'desc' },
+      },
+      specifications: true,
+    },
+  });
+}
+```
+
+## 🔍 Advanced Query Patterns
+
+### Complex Filtering with Relations
+```typescript
+async findProductsWithAdvancedFilters(filters: AdvancedProductFilters): Promise<Product[]> {
+  const where: Prisma.ProductWhereInput = {
+    isActive: true,
+  };
+
+  // Category hierarchy filtering
+  if (filters.categoryId) {
+    const categoryIds = await this.getCategoryAndDescendantsIds(filters.categoryId);
+    where.OR = [
+      { categoryId: { in: categoryIds } },
+      { subCategoryId: { in: categoryIds } },
+    ];
+  }
+
+  // Brand filtering
+  if (filters.brandIds && filters.brandIds.length > 0) {
+    where.brandId = { in: filters.brandIds };
+  }
+
+  // Tag filtering
+  if (filters.tagIds && filters.tagIds.length > 0) {
+    where.tags = {
+      some: {
+        tagId: { in: filters.tagIds },
+      },
+    };
+  }
+
+  // Price range filtering
+  if (filters.priceRange) {
+    where.price = {
+      gte: filters.priceRange.min,
+      lte: filters.priceRange.max,
+    };
+  }
+
+  // Stock filtering
+  if (filters.inStock !== undefined) {
+    where.stockQuantity = filters.inStock ? { gt: 0 } : { equals: 0 };
+  }
+
+  // Rating filtering
+  if (filters.minRating) {
+    where.averageRating = { gte: filters.minRating };
+  }
+
+  return this.prismaService.product.findMany({
+    where,
+    include: {
+      brand: true,
+      category: true,
+      images: { orderBy: { position: 'asc' } },
+      variants: true,
+      tags: { include: { tag: true } },
+    },
+    orderBy: this.buildOrderBy(filters.sortBy, filters.sortOrder),
+  });
+}
+```
+
+### Aggregation Queries
+```typescript
+async getProductAnalytics(sellerId?: string): Promise<ProductAnalytics> {
+  const where: Prisma.ProductWhereInput = {};
+  
+  if (sellerId) {
+    where.sellerId = sellerId;
+  }
+
+  const [
+    totalProducts,
+    activeProducts,
+    lowStockProducts,
+    averagePrice,
+    priceRange,
+  ] = await Promise.all([
+    this.prismaService.product.count({ where }),
+    this.prismaService.product.count({ where: { ...where, isActive: true } }),
+    this.prismaService.product.count({
+      where: { ...where, stockQuantity: { lte: 5 } },
+    }),
+    this.prismaService.product.aggregate({
+      where,
+      _avg: { price: true },
+    }),
+    this.prismaService.product.aggregate({
+      where,
+      _min: { price: true },
+      _max: { price: true },
+    }),
+  ]);
+
+  return {
+    totalProducts,
+    activeProducts,
+    lowStockProducts,
+    averagePrice: averagePrice._avg.price || 0,
+    minPrice: priceRange._min.price || 0,
+    maxPrice: priceRange._max.price || 0,
+  };
+}
+```
+
+## 🔄 Data Transformation Patterns
+
+### Entity to DTO Transformation
+```typescript
+private transformProductToDto(product: any): ProductResponseDto {
+  return {
+    id: product.id,
+    title: product.title,
+    slug: product.slug,
+    description: product.description,
+    price: product.price,
+    discountPrice: product.discountPrice,
+    stockQuantity: product.stockQuantity,
+    isActive: product.isActive,
+    isFeatured: product.isFeatured,
+    createdAt: product.createdAt,
+    updatedAt: product.updatedAt,
+    
+    // Transform nested objects
+    brand: product.brand ? {
+      id: product.brand.id,
+      name: product.brand.name,
+      logo: product.brand.logo,
+    } : null,
+    
+    category: product.category ? {
+      id: product.category.id,
+      name: product.category.name,
+      slug: product.category.slug,
+    } : null,
+    
+    images: product.images?.map((image: any) => ({
+      id: image.id,
+      imageUrl: image.imageUrl,
+      altText: image.altText,
+      position: image.position,
+    })) || [],
+    
+    variants: product.variants?.map((variant: any) => ({
+      id: variant.id,
+      variantName: variant.variantName,
+      price: variant.price,
+      stockQuantity: variant.stockQuantity,
+    })) || [],
+    
+    tags: product.tags?.map((productTag: any) => ({
+      id: productTag.tag.id,
+      name: productTag.tag.name,
+    })) || [],
+  };
+}
+```
+
+## 🚀 Performance Optimization
+
+### Connection Pooling
+```typescript
+// prisma/schema.prisma
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  // Connection pooling configuration
+}
+
+// Environment variables
+DATABASE_URL="postgresql://user:password@localhost:5432/ecommerce?connection_limit=20&pool_timeout=20"
+```
+
+### Query Optimization
+```typescript
+// Use select to limit fields
+async findProductTitles(): Promise<{ id: string; title: string }[]> {
+  return this.prismaService.product.findMany({
+    select: {
+      id: true,
+      title: true,
+    },
+    where: { isActive: true },
+  });
+}
+
+// Use distinct for unique values
+async findUniqueBrands(): Promise<string[]> {
+  const brands = await this.prismaService.product.findMany({
+    select: { brand: { select: { name: true } } },
+    where: { isActive: true },
+    distinct: ['brandId'],
+  });
+  
+  return brands.map(b => b.brand?.name).filter(Boolean);
+}
+
+// Use raw queries for complex operations
+async getProductSalesReport(startDate: Date, endDate: Date): Promise<SalesReport[]> {
+  return this.prismaService.$queryRaw`
+    SELECT 
+      p.id,
+      p.title,
+      COUNT(oi.id) as total_orders,
+      SUM(oi.quantity) as total_quantity,
+      SUM(oi.price * oi.quantity) as total_revenue
+    FROM products p
+    LEFT JOIN order_items oi ON p.id = oi.product_id
+    LEFT JOIN orders o ON oi.order_id = o.id
+    WHERE o.created_at BETWEEN ${startDate} AND ${endDate}
+    GROUP BY p.id, p.title
+    ORDER BY total_revenue DESC
+  `;
+}
+```
+
+This ensures efficient, scalable database operations with proper transaction handling, query optimization, and data transformation patterns.

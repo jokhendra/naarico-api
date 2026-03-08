@@ -1,0 +1,634 @@
+---
+globs: *.spec.ts,*test*.ts,*e2e*.ts
+---
+
+# Testing Patterns
+
+## 🧪 Unit Testing Standards
+
+### Service Unit Tests
+```typescript
+describe('ProductService', () => {
+  let service: ProductService;
+  let prismaService: PrismaService;
+  let logger: AppLogger;
+
+  beforeEach(async () => {
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        ProductService,
+        {
+          provide: PrismaService,
+          useValue: {
+            product: {
+              findMany: jest.fn(),
+              findUnique: jest.fn(),
+              create: jest.fn(),
+              update: jest.fn(),
+              delete: jest.fn(),
+            },
+          },
+        },
+        {
+          provide: AppLogger,
+          useValue: {
+            setContext: jest.fn(),
+            log: jest.fn(),
+            error: jest.fn(),
+          },
+        },
+      ],
+    }).compile();
+
+    service = module.get<ProductService>(ProductService);
+    prismaService = module.get<PrismaService>(PrismaService);
+    logger = module.get<AppLogger>(AppLogger);
+  });
+
+  describe('findAll', () => {
+    it('should return products with default pagination', async () => {
+      // Arrange
+      const mockProducts = [
+        {
+          id: '1',
+          title: 'Test Product',
+          price: 100,
+          isActive: true,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        },
+      ];
+      
+      jest.spyOn(prismaService.product, 'findMany').mockResolvedValue(mockProducts);
+      jest.spyOn(prismaService.product, 'count').mockResolvedValue(1);
+
+      // Act
+      const result = await service.findAll({});
+
+      // Assert
+      expect(result.data).toHaveLength(1);
+      expect(result.total).toBe(1);
+      expect(result.page).toBe(1);
+      expect(result.limit).toBe(10);
+      expect(prismaService.product.findMany).toHaveBeenCalledWith({
+        where: { isActive: true },
+        include: expect.any(Object),
+        orderBy: expect.any(Object),
+        skip: 0,
+        take: 10,
+      });
+    });
+
+    it('should filter products by category', async () => {
+      // Arrange
+      const filterDto = { categoryId: 'cat-1' };
+      jest.spyOn(prismaService.product, 'findMany').mockResolvedValue([]);
+      jest.spyOn(prismaService.product, 'count').mockResolvedValue(0);
+
+      // Act
+      await service.findAll(filterDto);
+
+      // Assert
+      expect(prismaService.product.findMany).toHaveBeenCalledWith({
+        where: {
+          isActive: true,
+          categoryId: 'cat-1',
+        },
+        include: expect.any(Object),
+        orderBy: expect.any(Object),
+        skip: 0,
+        take: 10,
+      });
+    });
+
+    it('should throw NotFoundException when product not found', async () => {
+      // Arrange
+      jest.spyOn(prismaService.product, 'findUnique').mockResolvedValue(null);
+
+      // Act & Assert
+      await expect(service.findOne('non-existent-id')).rejects.toThrow(
+        NotFoundException,
+      );
+    });
+  });
+});
+```
+
+### Controller Unit Tests
+```typescript
+describe('ProductsController', () => {
+  let controller: ProductsController;
+  let service: ProductService;
+
+  beforeEach(async () => {
+    const module: TestingModule = await Test.createTestingModule({
+      controllers: [ProductsController],
+      providers: [
+        {
+          provide: ProductService,
+          useValue: {
+            findAll: jest.fn(),
+            findOne: jest.fn(),
+            create: jest.fn(),
+            update: jest.fn(),
+            remove: jest.fn(),
+          },
+        },
+      ],
+    }).compile();
+
+    controller = module.get<ProductsController>(ProductsController);
+    service = module.get<ProductService>(ProductService);
+  });
+
+  describe('findAll', () => {
+    it('should return paginated products', async () => {
+      // Arrange
+      const mockResponse = {
+        data: [{ id: '1', title: 'Test Product' }],
+        total: 1,
+        page: 1,
+        limit: 10,
+        totalPages: 1,
+        hasNextPage: false,
+        hasPreviousPage: false,
+      };
+      
+      jest.spyOn(service, 'findAll').mockResolvedValue(mockResponse);
+
+      // Act
+      const result = await controller.findAll({});
+
+      // Assert
+      expect(result).toEqual(mockResponse);
+      expect(service.findAll).toHaveBeenCalledWith({});
+    });
+  });
+
+  describe('create', () => {
+    it('should create product for admin', async () => {
+      // Arrange
+      const createDto = {
+        title: 'New Product',
+        price: 100,
+        sellerId: 'seller-1',
+        storeId: 'store-1',
+      };
+      
+      const sellerContext = {
+        isAdmin: true,
+        isSeller: false,
+        isAuthenticated: true,
+      };
+      
+      const mockProduct = { id: '1', ...createDto };
+      jest.spyOn(service, 'create').mockResolvedValue(mockProduct);
+
+      // Act
+      const result = await controller.create(createDto, sellerContext);
+
+      // Assert
+      expect(result).toEqual(mockProduct);
+      expect(service.create).toHaveBeenCalledWith(createDto, 'seller-1', 'store-1');
+    });
+
+    it('should create product for seller with their own ID', async () => {
+      // Arrange
+      const createDto = {
+        title: 'New Product',
+        price: 100,
+        storeId: 'store-1',
+      };
+      
+      const sellerContext = {
+        isAdmin: false,
+        isSeller: true,
+        isAuthenticated: true,
+        sellerId: 'seller-1',
+      };
+      
+      const mockProduct = { id: '1', ...createDto };
+      jest.spyOn(service, 'create').mockResolvedValue(mockProduct);
+
+      // Act
+      const result = await controller.create(createDto, sellerContext);
+
+      // Assert
+      expect(result).toEqual(mockProduct);
+      expect(service.create).toHaveBeenCalledWith(createDto, 'seller-1', 'store-1');
+    });
+  });
+});
+```
+
+## 🔧 Integration Testing
+
+### Service Integration Tests
+```typescript
+describe('ProductService Integration', () => {
+  let app: INestApplication;
+  let prismaService: PrismaService;
+  let productService: ProductService;
+
+  beforeAll(async () => {
+    const moduleFixture: TestingModule = await Test.createTestingModule({
+      imports: [AppModule],
+    }).compile();
+
+    app = moduleFixture.createNestApplication();
+    await app.init();
+
+    prismaService = app.get<PrismaService>(PrismaService);
+    productService = app.get<ProductService>(ProductService);
+  });
+
+  beforeEach(async () => {
+    // Clean database before each test
+    await prismaService.product.deleteMany();
+    await prismaService.brand.deleteMany();
+    await prismaService.category.deleteMany();
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  describe('createProduct', () => {
+    it('should create product with all relations', async () => {
+      // Arrange
+      const brand = await prismaService.brand.create({
+        data: { name: 'Test Brand', slug: 'test-brand' },
+      });
+      
+      const category = await prismaService.category.create({
+        data: { name: 'Test Category', slug: 'test-category' },
+      });
+
+      const createDto = {
+        title: 'Test Product',
+        price: 100,
+        brandId: brand.id,
+        categoryId: category.id,
+        sellerId: 'test-seller',
+        storeId: 'test-store',
+      };
+
+      // Act
+      const result = await productService.create(createDto, 'test-seller', 'test-store');
+
+      // Assert
+      expect(result.title).toBe('Test Product');
+      expect(result.price).toBe(100);
+      expect(result.brand.id).toBe(brand.id);
+      expect(result.category.id).toBe(category.id);
+
+      // Verify database state
+      const dbProduct = await prismaService.product.findUnique({
+        where: { id: result.id },
+        include: { brand: true, category: true },
+      });
+      
+      expect(dbProduct).toBeTruthy();
+      expect(dbProduct.title).toBe('Test Product');
+    });
+  });
+});
+```
+
+## 🌐 End-to-End Testing
+
+### E2E Test Setup
+```typescript
+describe('Products (e2e)', () => {
+  let app: INestApplication;
+  let prismaService: PrismaService;
+  let authToken: string;
+
+  beforeAll(async () => {
+    const moduleFixture: TestingModule = await Test.createTestingModule({
+      imports: [AppModule],
+    }).compile();
+
+    app = moduleFixture.createNestApplication();
+    await app.init();
+
+    prismaService = app.get<PrismaService>(PrismaService);
+    
+    // Setup test data
+    await setupTestData();
+    
+    // Get auth token
+    authToken = await getAuthToken();
+  });
+
+  beforeEach(async () => {
+    // Clean test data
+    await cleanupTestData();
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  describe('/products (GET)', () => {
+    it('should return paginated products', async () => {
+      // Arrange
+      await createTestProducts(5);
+
+      // Act
+      const response = await request(app.getHttpServer())
+        .get('/products')
+        .expect(200);
+
+      // Assert
+      expect(response.body.data).toHaveLength(5);
+      expect(response.body.total).toBe(5);
+      expect(response.body.page).toBe(1);
+      expect(response.body.limit).toBe(10);
+    });
+
+    it('should filter products by category', async () => {
+      // Arrange
+      const category = await createTestCategory();
+      await createTestProducts(3, { categoryId: category.id });
+      await createTestProducts(2); // Different category
+
+      // Act
+      const response = await request(app.getHttpServer())
+        .get(`/products?categoryId=${category.id}`)
+        .expect(200);
+
+      // Assert
+      expect(response.body.data).toHaveLength(3);
+      response.body.data.forEach((product: any) => {
+        expect(product.category.id).toBe(category.id);
+      });
+    });
+
+    it('should search products by title', async () => {
+      // Arrange
+      await createTestProducts(2, { title: 'iPhone 13' });
+      await createTestProducts(3, { title: 'Samsung Galaxy' });
+
+      // Act
+      const response = await request(app.getHttpServer())
+        .get('/products?search=iPhone')
+        .expect(200);
+
+      // Assert
+      expect(response.body.data).toHaveLength(2);
+      response.body.data.forEach((product: any) => {
+        expect(product.title).toContain('iPhone');
+      });
+    });
+  });
+
+  describe('/products (POST)', () => {
+    it('should create product with valid data', async () => {
+      // Arrange
+      const brand = await createTestBrand();
+      const category = await createTestCategory();
+      const createDto = {
+        title: 'New Product',
+        price: 100,
+        brandId: brand.id,
+        categoryId: category.id,
+        storeId: 'test-store',
+      };
+
+      // Act
+      const response = await request(app.getHttpServer())
+        .post('/products')
+        .set('Authorization', `Bearer ${authToken}`)
+        .send(createDto)
+        .expect(201);
+
+      // Assert
+      expect(response.body.title).toBe('New Product');
+      expect(response.body.price).toBe(100);
+      expect(response.body.brand.id).toBe(brand.id);
+      expect(response.body.category.id).toBe(category.id);
+
+      // Verify database
+      const dbProduct = await prismaService.product.findUnique({
+        where: { id: response.body.id },
+      });
+      expect(dbProduct).toBeTruthy();
+    });
+
+    it('should return 400 for invalid data', async () => {
+      // Arrange
+      const invalidDto = {
+        title: '', // Invalid: empty title
+        price: -10, // Invalid: negative price
+      };
+
+      // Act & Assert
+      await request(app.getHttpServer())
+        .post('/products')
+        .set('Authorization', `Bearer ${authToken}`)
+        .send(invalidDto)
+        .expect(400);
+    });
+
+    it('should return 401 without authentication', async () => {
+      // Arrange
+      const createDto = {
+        title: 'New Product',
+        price: 100,
+        storeId: 'test-store',
+      };
+
+      // Act & Assert
+      await request(app.getHttpServer())
+        .post('/products')
+        .send(createDto)
+        .expect(401);
+    });
+  });
+});
+```
+
+## 🛠️ Test Utilities
+
+### Test Data Factory
+```typescript
+export class TestDataFactory {
+  constructor(private prismaService: PrismaService) {}
+
+  async createTestUser(overrides: Partial<User> = {}): Promise<User> {
+    return this.prismaService.user.create({
+      data: {
+        email: 'test@example.com',
+        firstName: 'Test',
+        lastName: 'User',
+        password: 'hashedpassword',
+        role: 'USER',
+        ...overrides,
+      },
+    });
+  }
+
+  async createTestBrand(overrides: Partial<Brand> = {}): Promise<Brand> {
+    return this.prismaService.brand.create({
+      data: {
+        name: 'Test Brand',
+        slug: 'test-brand',
+        logo: 'https://example.com/logo.png',
+        ...overrides,
+      },
+    });
+  }
+
+  async createTestCategory(overrides: Partial<Category> = {}): Promise<Category> {
+    return this.prismaService.category.create({
+      data: {
+        name: 'Test Category',
+        slug: 'test-category',
+        description: 'Test category description',
+        ...overrides,
+      },
+    });
+  }
+
+  async createTestProduct(overrides: Partial<Product> = {}): Promise<Product> {
+    const brand = await this.createTestBrand();
+    const category = await this.createTestCategory();
+
+    return this.prismaService.product.create({
+      data: {
+        title: 'Test Product',
+        slug: 'test-product',
+        price: 100,
+        stockQuantity: 10,
+        isActive: true,
+        brandId: brand.id,
+        categoryId: category.id,
+        sellerId: 'test-seller',
+        storeId: 'test-store',
+        ...overrides,
+      },
+    });
+  }
+
+  async createTestProducts(count: number, overrides: Partial<Product> = {}): Promise<Product[]> {
+    const products = [];
+    for (let i = 0; i < count; i++) {
+      products.push(await this.createTestProduct({
+        title: `Test Product ${i + 1}`,
+        slug: `test-product-${i + 1}`,
+        ...overrides,
+      }));
+    }
+    return products;
+  }
+}
+```
+
+### Test Helpers
+```typescript
+export class TestHelpers {
+  static async getAuthToken(app: INestApplication, userRole: Role = Role.USER): Promise<string> {
+    const user = await TestDataFactory.createTestUser({ role: userRole });
+    
+    const response = await request(app.getHttpServer())
+      .post('/auth/login')
+      .send({
+        email: user.email,
+        password: 'password',
+      });
+
+    return response.body.accessToken;
+  }
+
+  static async cleanupDatabase(prismaService: PrismaService): Promise<void> {
+    // Delete in reverse order of dependencies
+    await prismaService.orderItem.deleteMany();
+    await prismaService.order.deleteMany();
+    await prismaService.productVariant.deleteMany();
+    await prismaService.productImage.deleteMany();
+    await prismaService.productTag.deleteMany();
+    await prismaService.product.deleteMany();
+    await prismaService.brand.deleteMany();
+    await prismaService.category.deleteMany();
+    await prismaService.user.deleteMany();
+  }
+
+  static expectValidProductResponse(product: any): void {
+    expect(product).toHaveProperty('id');
+    expect(product).toHaveProperty('title');
+    expect(product).toHaveProperty('slug');
+    expect(product).toHaveProperty('price');
+    expect(product).toHaveProperty('createdAt');
+    expect(product).toHaveProperty('updatedAt');
+    expect(typeof product.id).toBe('string');
+    expect(typeof product.title).toBe('string');
+    expect(typeof product.price).toBe('number');
+  }
+
+  static expectValidPaginatedResponse(response: any): void {
+    expect(response).toHaveProperty('data');
+    expect(response).toHaveProperty('total');
+    expect(response).toHaveProperty('page');
+    expect(response).toHaveProperty('limit');
+    expect(response).toHaveProperty('totalPages');
+    expect(response).toHaveProperty('hasNextPage');
+    expect(response).toHaveProperty('hasPreviousPage');
+    expect(Array.isArray(response.data)).toBe(true);
+    expect(typeof response.total).toBe('number');
+    expect(typeof response.page).toBe('number');
+  }
+}
+```
+
+## 📊 Test Configuration
+
+### Jest Configuration
+```typescript
+// jest.config.js
+module.exports = {
+  moduleFileExtensions: ['js', 'json', 'ts'],
+  rootDir: 'src',
+  testRegex: '.*\\.spec\\.ts$',
+  transform: {
+    '^.+\\.(t|j)s$': 'ts-jest',
+  },
+  collectCoverageFrom: [
+    '**/*.(t|j)s',
+    '!**/*.spec.ts',
+    '!**/*.e2e-spec.ts',
+    '!**/node_modules/**',
+  ],
+  coverageDirectory: '../coverage',
+  testEnvironment: 'node',
+  setupFilesAfterEnv: ['<rootDir>/../test/setup.ts'],
+  moduleNameMapping: {
+    '^src/(.*)$': '<rootDir>/$1',
+  },
+};
+```
+
+### Test Setup
+```typescript
+// test/setup.ts
+import { Test } from '@nestjs/testing';
+import { PrismaService } from '../src/common/prisma.service';
+
+beforeAll(async () => {
+  // Global test setup
+});
+
+afterAll(async () => {
+  // Global test cleanup
+});
+
+beforeEach(async () => {
+  // Test-specific setup
+});
+
+afterEach(async () => {
+  // Test-specific cleanup
+});
+```
+
+This ensures comprehensive testing coverage with unit tests, integration tests, and end-to-end tests following best practices for NestJS applications.

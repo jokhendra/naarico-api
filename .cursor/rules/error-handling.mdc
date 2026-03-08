@@ -1,0 +1,422 @@
+---
+globs: *.service.ts,*filter*.ts,*exception*.ts
+---
+
+# Error Handling and Logging Patterns
+
+## 🚨 Error Handling Standards
+
+### Exception Hierarchy
+```typescript
+// Use specific NestJS exceptions with custom error codes
+throw new NotFoundException(`Product with ID ${id} not found`);
+throw new ConflictException(`Product with slug '${slug}' already exists`);
+throw new BadRequestException('Invalid input data');
+throw new ForbiddenException('You can only update your own products');
+throw new UnauthorizedException('Authentication required');
+throw new InternalServerErrorException('Operation failed');
+```
+
+### Custom Exception Pattern
+```typescript
+import { HttpException, HttpStatus } from '@nestjs/common';
+import { ErrorCode } from '../common/constants/error-codes.enum';
+
+export class CustomHttpException extends HttpException {
+  constructor(message: string, status: HttpStatus, errorCode: ErrorCode) {
+    super(
+      {
+        message,
+        errorCode,
+      },
+      status,
+    );
+  }
+}
+
+// Usage
+throw new CustomHttpException(
+  'Custom error message',
+  HttpStatus.BAD_REQUEST,
+  ErrorCode.INVALID_INPUT
+);
+```
+
+### Service Error Handling Pattern
+```typescript
+@Injectable()
+export class ProductService {
+  constructor(
+    private readonly prismaService: PrismaService,
+    private readonly logger: AppLogger,
+  ) {
+    this.logger.setContext('ProductService');
+  }
+
+  async findOne(id: string): Promise<ProductResponseDto> {
+    try {
+      const product = await this.prismaService.product.findUnique({
+        where: { id },
+        include: { brand: true, category: true },
+      });
+
+      if (!product) {
+        throw new NotFoundException(`Product with ID ${id} not found`);
+      }
+
+      return this.transformProductToDto(product);
+    } catch (error) {
+      // Re-throw known exceptions
+      if (error instanceof NotFoundException) {
+        throw error;
+      }
+      
+      // Log and wrap unknown errors
+      this.logger.error(
+        `Error retrieving product ${id}: ${error.message}`,
+        error.stack,
+      );
+      throw new InternalServerErrorException(
+        `Failed to retrieve product with ID ${id}`,
+      );
+    }
+  }
+}
+```
+
+## 📝 Logging Standards
+
+### Logger Service Usage
+```typescript
+@Injectable()
+export class ProductService {
+  constructor(private readonly logger: AppLogger) {
+    this.logger.setContext('ProductService');
+  }
+
+  async create(createDto: CreateProductDto): Promise<ProductResponseDto> {
+    try {
+      // Log operation start
+      this.logger.log(`Creating product: ${createDto.title}`);
+      
+      const product = await this.prismaService.product.create({
+        data: createDto,
+      });
+
+      // Log success
+      this.logger.log(`Created product: ${product.id} - ${product.title}`);
+      
+      return this.transformProductToDto(product);
+    } catch (error) {
+      // Log error with context
+      this.logger.error(
+        `Error creating product: ${error.message}`,
+        error.stack,
+      );
+      throw new InternalServerErrorException('Failed to create product');
+    }
+  }
+}
+```
+
+### Structured Logging
+```typescript
+// Success logging
+this.logger.log({
+  message: 'Product created successfully',
+  productId: product.id,
+  title: product.title,
+  sellerId: product.sellerId,
+  timestamp: new Date().toISOString(),
+});
+
+// Error logging
+this.logger.error({
+  message: 'Failed to create product',
+  error: error.message,
+  stack: error.stack,
+  input: createDto,
+  timestamp: new Date().toISOString(),
+});
+```
+
+## 🔍 Global Exception Filter
+
+### Exception Filter Pattern
+```typescript
+@Catch()
+export class AllExceptionsFilter implements ExceptionFilter {
+  constructor(private readonly logger: AppLogger) {
+    this.logger.setContext('ExceptionFilter');
+  }
+
+  catch(exception: unknown, host: ArgumentsHost) {
+    const ctx = host.switchToHttp();
+    const response = ctx.getResponse<Response>();
+    const request = ctx.getRequest<Request>();
+
+    let status = HttpStatus.INTERNAL_SERVER_ERROR;
+    let message = 'Internal server error';
+    let errorCode = ErrorCode.INTERNAL_SERVER_ERROR;
+    let errorDetails: any = {};
+
+    // Handle NestJS HTTP exceptions
+    if (exception instanceof HttpException) {
+      status = exception.getStatus();
+      const errorResponse = exception.getResponse();
+
+      if (typeof errorResponse === 'object' && 'errorCode' in errorResponse) {
+        errorCode = errorResponse.errorCode as ErrorCode;
+        message = errorResponse.message as string;
+        errorDetails = { ...errorResponse };
+        delete errorDetails.errorCode;
+        delete errorDetails.message;
+      } else {
+        message = typeof errorResponse === 'object' && 'message' in errorResponse
+          ? Array.isArray(errorResponse.message)
+            ? errorResponse.message[0]
+            : errorResponse.message
+          : exception.message;
+        errorCode = this.getErrorCodeFromStatus(status);
+      }
+    }
+    // Handle Prisma errors
+    else if (exception instanceof PrismaClientKnownRequestError) {
+      const prismaError = this.handlePrismaError(exception);
+      status = prismaError.status;
+      message = prismaError.message;
+      errorCode = prismaError.code;
+      errorDetails = { prismaError: exception.code, meta: exception.meta };
+    }
+    // Handle unknown errors
+    else if (exception instanceof Error) {
+      message = exception.message;
+      errorDetails = {
+        name: exception.name,
+        stack: process.env.NODE_ENV === 'development' ? exception.stack : undefined,
+      };
+    }
+
+    // Log the error
+    this.logger.error({
+      message: `${request.method} ${request.url} - Status ${status} - ${message}`,
+      exception: exception instanceof Error ? exception.name : 'UnknownError',
+      errorCode,
+      path: request.url,
+      method: request.method,
+      body: request.body,
+      query: request.query,
+      params: request.params,
+      statusCode: status,
+      stack: exception instanceof Error ? exception.stack : undefined,
+      timestamp: new Date().toISOString(),
+    });
+
+    // Return standardized error response
+    response.status(status).json({
+      statusCode: status,
+      errorCode: errorCode,
+      message: message,
+      details: Object.keys(errorDetails).length > 0 ? errorDetails : undefined,
+      timestamp: new Date().toISOString(),
+      path: request.url,
+    });
+  }
+}
+```
+
+### Prisma Error Handling
+```typescript
+private handlePrismaError(error: PrismaClientKnownRequestError): {
+  status: number;
+  message: string;
+  code: ErrorCode;
+} {
+  switch (error.code) {
+    case 'P2002': // Unique constraint violation
+      return {
+        status: HttpStatus.CONFLICT,
+        message: `Unique constraint violation: ${error.meta?.target}`,
+        code: ErrorCode.UNIQUE_CONSTRAINT_VIOLATION,
+      };
+    case 'P2025': // Record not found
+      return {
+        status: HttpStatus.NOT_FOUND,
+        message: 'Record not found',
+        code: ErrorCode.RECORD_NOT_FOUND,
+      };
+    case 'P2003': // Foreign key constraint violation
+      return {
+        status: HttpStatus.BAD_REQUEST,
+        message: 'Foreign key constraint violation',
+        code: ErrorCode.FOREIGN_KEY_CONSTRAINT_VIOLATION,
+      };
+    default:
+      return {
+        status: HttpStatus.INTERNAL_SERVER_ERROR,
+        message: `Database error: ${error.message}`,
+        code: ErrorCode.DATABASE_ERROR,
+      };
+  }
+}
+```
+
+## 🎯 Error Codes
+
+### Error Code Enum
+```typescript
+export enum ErrorCode {
+  // General HTTP errors
+  BAD_REQUEST = 'BAD_REQUEST',
+  UNAUTHORIZED = 'UNAUTHORIZED',
+  FORBIDDEN = 'FORBIDDEN',
+  NOT_FOUND = 'NOT_FOUND',
+  CONFLICT = 'CONFLICT',
+  UNPROCESSABLE_ENTITY = 'UNPROCESSABLE_ENTITY',
+  TOO_MANY_REQUESTS = 'TOO_MANY_REQUESTS',
+  INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR',
+
+  // Validation errors
+  VALIDATION_ERROR = 'VALIDATION_ERROR',
+  INVALID_INPUT = 'INVALID_INPUT',
+
+  // Authentication errors
+  INVALID_CREDENTIALS = 'INVALID_CREDENTIALS',
+  INVALID_TOKEN = 'INVALID_TOKEN',
+  TOKEN_EXPIRED = 'TOKEN_EXPIRED',
+
+  // Database errors
+  DATABASE_ERROR = 'DATABASE_ERROR',
+  UNIQUE_CONSTRAINT_VIOLATION = 'UNIQUE_CONSTRAINT_VIOLATION',
+  FOREIGN_KEY_CONSTRAINT_VIOLATION = 'FOREIGN_KEY_CONSTRAINT_VIOLATION',
+  RECORD_NOT_FOUND = 'RECORD_NOT_FOUND',
+
+  // Business logic errors
+  INSUFFICIENT_STOCK = 'INSUFFICIENT_STOCK',
+  PAYMENT_FAILED = 'PAYMENT_FAILED',
+  ORDER_ALREADY_PROCESSED = 'ORDER_ALREADY_PROCESSED',
+  INVALID_OPERATION = 'INVALID_OPERATION',
+}
+```
+
+## 🔄 Transaction Error Handling
+
+### Database Transaction Pattern
+```typescript
+async createProductWithVariants(createDto: CreateProductDto): Promise<ProductResponseDto> {
+  try {
+    const product = await this.prismaService.$transaction(async (prisma) => {
+      // Create product
+      const newProduct = await prisma.product.create({
+        data: productData,
+      });
+
+      // Create variants
+      if (createDto.variants && createDto.variants.length > 0) {
+        await Promise.all(
+          createDto.variants.map((variant) =>
+            prisma.productVariant.create({
+              data: {
+                productId: newProduct.id,
+                ...variant,
+              },
+            }),
+          ),
+        );
+      }
+
+      return newProduct;
+    });
+
+    this.logger.log(`Created product with variants: ${product.id}`);
+    return this.transformProductToDto(product);
+  } catch (error) {
+    this.logger.error(
+      `Error creating product with variants: ${error.message}`,
+      error.stack,
+    );
+    throw new InternalServerErrorException('Failed to create product');
+  }
+}
+```
+
+## 📊 Error Response Format
+
+### Standardized Error Response
+```typescript
+interface ErrorResponse {
+  statusCode: number;
+  errorCode: string;
+  message: string;
+  details?: any;
+  timestamp: string;
+  path: string;
+}
+
+// Example error response
+{
+  "statusCode": 404,
+  "errorCode": "NOT_FOUND",
+  "message": "Product with ID 123 not found",
+  "timestamp": "2023-01-01T00:00:00.000Z",
+  "path": "/api/products/123"
+}
+```
+
+## 🚀 Performance Error Handling
+
+### Timeout Handling
+```typescript
+async findProductsWithTimeout(filterDto: ProductFilterDto): Promise<ProductResponseDto[]> {
+  try {
+    const products = await Promise.race([
+      this.prismaService.product.findMany({
+        where: this.buildWhereClause(filterDto),
+        include: { brand: true, category: true },
+      }),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('Query timeout')), 5000)
+      ),
+    ]);
+
+    return products.map(product => this.transformProductToDto(product));
+  } catch (error) {
+    if (error.message === 'Query timeout') {
+      this.logger.warn('Product query timed out', { filterDto });
+      throw new InternalServerErrorException('Query timeout - please try again');
+    }
+    throw error;
+  }
+}
+```
+
+## 🔍 Validation Error Handling
+
+### DTO Validation Errors
+```typescript
+// Global validation pipe configuration
+app.useGlobalPipes(
+  new ValidationPipe({
+    whitelist: true,
+    forbidNonWhitelisted: true,
+    transform: true,
+    transformOptions: {
+      enableImplicitConversion: true,
+    },
+    exceptionFactory: (errors: ValidationError[]) => {
+      const result = errors.map((error) => ({
+        property: error.property,
+        value: error.value,
+        constraints: error.constraints,
+      }));
+      return new BadRequestException({
+        message: 'Validation failed',
+        errorCode: ErrorCode.VALIDATION_ERROR,
+        details: result,
+      });
+    },
+  }),
+);
+```
+
+This ensures consistent, comprehensive error handling and logging throughout the application with proper error codes and structured responses.

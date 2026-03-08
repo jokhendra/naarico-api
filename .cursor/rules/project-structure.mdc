@@ -1,0 +1,126 @@
+---
+alwaysApply: true
+---
+
+# E-Commerce API Project Structure Guide
+
+This is a **NestJS-based e-commerce API** with modular architecture, multi-tenancy support, and enterprise-grade features.
+
+## 🏗️ Core Architecture
+
+### Application Structure
+- **Framework**: NestJS with TypeScript
+- **Database**: PostgreSQL with Prisma ORM
+- **Caching**: Redis for session management and caching
+- **Search**: Elasticsearch for advanced product search
+- **Authentication**: JWT with Passport
+- **File Storage**: AWS S3 for product images
+- **Payment**: Multiple providers (Razorpay, etc.)
+
+### Module Organization
+```
+src/
+├── app.module.ts              # Root module with global configuration
+├── main.ts                   # Application entry point
+├── common/                   # Shared utilities and services
+│   ├── guards/              # Authentication & authorization guards
+│   ├── decorators/          # Custom decorators
+│   ├── services/            # Shared services (logger, etc.)
+│   └── constants/           # Enums and constants
+├── modules/                 # Business domain modules
+│   ├── auth/               # Authentication & user management
+│   ├── products/           # Product catalog management
+│   ├── orders/             # Order processing
+│   ├── payments/           # Payment processing
+│   ├── carts/              # Shopping cart functionality
+│   └── [20+ other modules] # Complete e-commerce features
+├── config/                 # Configuration modules
+├── filters/                # Global exception filters
+├── interceptors/           # Request/response interceptors
+└── health/                # Health check endpoints
+```
+
+## 🎯 Key Design Patterns
+
+### 1. Modular Architecture
+- Each business domain is a separate NestJS module
+- Modules export services for cross-module dependencies
+- Clear separation of concerns between modules
+
+### 2. Multi-Tenancy Support
+- Seller-based data isolation
+- Store management within seller context
+- Admin override capabilities
+
+### 3. Layered Architecture
+- **Controllers**: Handle HTTP requests/responses
+- **Services**: Business logic and data processing
+- **DTOs**: Data validation and transformation
+- **Guards**: Authentication and authorization
+- **Filters**: Global error handling
+
+## 📁 File Naming Conventions
+
+### Module Files
+- `[module].module.ts` - Module definition
+- `[module].controller.ts` - HTTP endpoints
+- `[module].service.ts` - Business logic
+- `dto/` - Data Transfer Objects directory
+
+### Common Patterns
+- Use kebab-case for file names
+- Group related files in directories
+- Export DTOs from `dto/index.ts`
+- Use barrel exports for clean imports
+
+## 🔧 Configuration Management
+
+### Environment Variables
+- Use `ConfigModule` for environment configuration
+- Validate required variables at startup
+- Support for development/production configs
+
+### Database Configuration
+- Prisma schema in `prisma/schema.prisma`
+- Migrations in `prisma/migrations/`
+- Seed data in `prisma/seed.ts`
+
+## 📊 Key Features
+
+### E-Commerce Capabilities
+- Product catalog with variants and specifications
+- Multi-level category hierarchy
+- Shopping cart and wishlist
+- Order management and tracking
+- Payment processing with multiple providers
+- Review and rating system
+- Inventory management
+- Deal and coupon system
+- Analytics and recommendations
+
+### Enterprise Features
+- Multi-seller marketplace support
+- Store management and approval workflow
+- Advanced search with Elasticsearch
+- Real-time notifications
+- Background job processing
+- Comprehensive logging and monitoring
+- Rate limiting and security
+- Health checks and metrics
+
+## 🚀 Development Workflow
+
+### Scripts Available
+- `npm run start:dev` - Development server
+- `npm run build` - Production build
+- `npm run test` - Run tests
+- `npm run test:e2e` - End-to-end tests
+- `npm run lint` - Code linting
+- `npm run format` - Code formatting
+
+### Database Management
+- `npx prisma migrate dev` - Create migrations
+- `npx prisma generate` - Generate Prisma client
+- `npx prisma studio` - Database GUI
+
+This architecture supports **high-traffic e-commerce** with **real-time analytics**, **ML-powered recommendations**, and **comprehensive monitoring**.

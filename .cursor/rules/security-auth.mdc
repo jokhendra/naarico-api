@@ -1,0 +1,474 @@
+---
+globs: *guard*.ts,*auth*.ts,*security*.ts
+---
+
+# Security and Authentication Patterns
+
+## 🔐 Authentication Standards
+
+### JWT Authentication Guard
+```typescript
+@Injectable()
+export class JwtAuthGuard extends AuthGuard('jwt') {
+  constructor(private reflector: Reflector) {
+    super();
+  }
+
+  canActivate(context: ExecutionContext): boolean | Promise<boolean> | Observable<boolean> {
+    // Check if route is public
+    const isPublic = this.reflector.getAllAndOverride<boolean>(IS_PUBLIC_KEY, [
+      context.getHandler(),
+      context.getClass(),
+    ]);
+
+    // For public routes, try to authenticate but don't fail
+    if (isPublic) {
+      return super.canActivate(context) as Promise<boolean> | boolean;
+    }
+
+    // For protected routes, enforce authentication
+    return super.canActivate(context);
+  }
+
+  handleRequest(err: any, user: any, info: any, context: ExecutionContext) {
+    const isPublic = this.reflector.getAllAndOverride<boolean>(IS_PUBLIC_KEY, [
+      context.getHandler(),
+      context.getClass(),
+    ]);
+
+    // Public routes allow unauthenticated access
+    if (isPublic) {
+      return user || null;
+    }
+
+    // Protected routes require authentication
+    if (err) {
+      console.error('JWT Authentication Error:', {
+        error: err.message,
+        route: context.switchToHttp().getRequest().url,
+      });
+      throw err;
+    }
+    
+    if (!user) {
+      throw new UnauthorizedException('Authentication required');
+    }
+
+    return user;
+  }
+}
+```
+
+### Public Route Decorator
+```typescript
+export const IS_PUBLIC_KEY = 'isPublic';
+export const Public = () => SetMetadata(IS_PUBLIC_KEY, true);
+
+// Usage
+@Public()
+@Get('public-endpoint')
+async getPublicData() {
+  return { message: 'This is public data' };
+}
+```
+
+## 🛡️ Authorization Patterns
+
+### Role-Based Access Control
+```typescript
+// Roles decorator
+export const Roles = (...roles: Role[]) => SetMetadata('roles', roles);
+
+// Roles guard
+@Injectable()
+export class RolesGuard implements CanActivate {
+  constructor(private reflector: Reflector) {}
+
+  canActivate(context: ExecutionContext): boolean {
+    const requiredRoles = this.reflector.getAllAndOverride<Role[]>('roles', [
+      context.getHandler(),
+      context.getClass(),
+    ]);
+
+    if (!requiredRoles) {
+      return true;
+    }
+
+    const { user } = context.switchToHttp().getRequest();
+    
+    if (!user) {
+      throw new UnauthorizedException('User not authenticated');
+    }
+
+    const hasRole = requiredRoles.some((role) => user.role === role);
+    
+    if (!hasRole) {
+      throw new ForbiddenException('Insufficient permissions');
+    }
+
+    return true;
+  }
+}
+
+// Usage
+@UseGuards(AuthGuard('jwt'), RolesGuard)
+@Roles(Role.ADMIN, Role.SELLER)
+@Get('admin-endpoint')
+async getAdminData() {
+  return { message: 'Admin data' };
+}
+```
+
+### Ownership-Based Access Control
+```typescript
+@Injectable()
+export class OwnershipGuard implements CanActivate {
+  constructor(private prismaService: PrismaService) {}
+
+  async canActivate(context: ExecutionContext): Promise<boolean> {
+    const request = context.switchToHttp().getRequest();
+    const user = request.user;
+    const resourceType = this.reflector.get<string>('resourceType', context.getHandler());
+
+    if (!user || !resourceType) {
+      return true;
+    }
+
+    // Admin can access everything
+    if (user.role === Role.ADMIN) {
+      return true;
+    }
+
+    const resourceId = request.params.id;
+    const resource = await this.getResource(resourceType, resourceId);
+
+    if (!resource) {
+      throw new NotFoundException(`${resourceType} not found`);
+    }
+
+    // Check ownership
+    const isOwner = this.checkOwnership(resource, user);
+    
+    if (!isOwner) {
+      throw new ForbiddenException('You can only access your own resources');
+    }
+
+    return true;
+  }
+
+  private async getResource(resourceType: string, id: string) {
+    switch (resourceType) {
+      case 'product':
+        return this.prismaService.product.findUnique({
+          where: { id },
+          select: { id: true, sellerId: true },
+        });
+      case 'order':
+        return this.prismaService.order.findUnique({
+          where: { id },
+          select: { id: true, userId: true },
+        });
+      default:
+        return null;
+    }
+  }
+
+  private checkOwnership(resource: any, user: any): boolean {
+    if (resource.sellerId) {
+      return resource.sellerId === user.sellerId;
+    }
+    if (resource.userId) {
+      return resource.userId === user.id;
+    }
+    return false;
+  }
+}
+
+// Usage
+@UseGuards(AuthGuard('jwt'), RolesGuard, OwnershipGuard)
+@Roles(Role.ADMIN, Role.SELLER)
+@ResourceType('product')
+@Get(':id')
+async getProduct(@Param('id') id: string) {
+  return this.productService.findOne(id);
+}
+```
+
+## 🏪 Multi-Tenancy Security
+
+### Seller Context Pattern
+```typescript
+export interface SellerContext {
+  isAdmin: boolean;
+  isSeller: boolean;
+  isAuthenticated: boolean;
+  sellerId?: string;
+  userId?: string;
+  role?: Role;
+}
+
+export const GetSellerContext = createParamDecorator(
+  (data: unknown, ctx: ExecutionContext): SellerContext => {
+    const request = ctx.switchToHttp().getRequest();
+    const user = request.user;
+
+    if (!user) {
+      return {
+        isAdmin: false,
+        isSeller: false,
+        isAuthenticated: false,
+      };
+    }
+
+    return {
+      isAdmin: user.role === Role.ADMIN,
+      isSeller: user.role === Role.SELLER,
+      isAuthenticated: true,
+      sellerId: user.sellerId,
+      userId: user.id,
+      role: user.role,
+    };
+  },
+);
+
+// Usage in controller
+async createProduct(
+  @Body() createDto: CreateProductDto,
+  @GetSellerContext() sellerContext: SellerContext,
+): Promise<ProductResponseDto> {
+  if (sellerContext.isAdmin) {
+    // Admin must specify sellerId
+    if (!createDto.sellerId) {
+      throw new BadRequestException('Admin must provide sellerId');
+    }
+    return this.productService.create(createDto, createDto.sellerId);
+  } else if (sellerContext.isSeller) {
+    // Seller uses their own ID
+    return this.productService.create(createDto, sellerContext.sellerId);
+  } else {
+    throw new ForbiddenException('Only admins and sellers can create products');
+  }
+}
+```
+
+### Data Isolation in Services
+```typescript
+@Injectable()
+export class ProductService {
+  async findAll(filterDto: ProductFilterDto, sellerContext?: SellerContext): Promise<ProductResponseDto[]> {
+    const where: Prisma.ProductWhereInput = {
+      isActive: true,
+    };
+
+    // TENANT ISOLATION: Filter by seller if not admin
+    if (sellerContext?.sellerId && !sellerContext.isAdmin) {
+      where.sellerId = sellerContext.sellerId;
+    }
+
+    // Only show products from approved stores (for public API)
+    if (!sellerContext || !sellerContext.isAuthenticated) {
+      where.store = {
+        status: 'APPROVED',
+        isOnVacation: false,
+      };
+    }
+
+    return this.prismaService.product.findMany({ where });
+  }
+}
+```
+
+## 🔒 Input Validation and Sanitization
+
+### DTO Validation with Security
+```typescript
+export class CreateProductDto {
+  @IsString()
+  @IsNotEmpty()
+  @MinLength(3)
+  @MaxLength(100)
+  @Transform(({ value }) => value?.trim()) // Sanitize input
+  title: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(1000)
+  @Transform(({ value }) => value?.trim())
+  description?: string;
+
+  @IsNumber()
+  @IsPositive()
+  @Min(0.01)
+  @Max(999999.99) // Prevent extremely large prices
+  price: number;
+
+  @IsOptional()
+  @IsArray()
+  @IsUUID(4, { each: true })
+  @ArrayMaxSize(10) // Limit number of tags
+  tagIds?: string[];
+}
+```
+
+### SQL Injection Prevention
+```typescript
+// Always use Prisma's parameterized queries
+async searchProducts(searchTerm: string): Promise<Product[]> {
+  // ✅ Safe - Prisma handles parameterization
+  return this.prismaService.product.findMany({
+    where: {
+      OR: [
+        { title: { contains: searchTerm, mode: 'insensitive' } },
+        { description: { contains: searchTerm, mode: 'insensitive' } },
+      ],
+    },
+  });
+
+  // ❌ Never do this - vulnerable to SQL injection
+  // return this.prismaService.$queryRaw`SELECT * FROM products WHERE title LIKE '%${searchTerm}%'`;
+}
+```
+
+## 🚫 Rate Limiting
+
+### Global Rate Limiting
+```typescript
+// Rate limiting configuration
+@Module({
+  imports: [
+    ThrottlerModule.forRootAsync({
+      imports: [ConfigModule],
+      inject: [ConfigService],
+      useFactory: (config: ConfigService) => ({
+        throttlers: [
+          {
+            ttl: config.get('THROTTLE_TTL', 60000), // 1 minute
+            limit: config.get('THROTTLE_LIMIT', 10), // 10 requests per minute
+          },
+        ],
+      }),
+    }),
+  ],
+})
+export class RateLimitModule {}
+
+// Controller-level rate limiting
+@Controller('products')
+@Throttle({ default: { limit: 5, ttl: 60000 } }) // 5 requests per minute
+export class ProductsController {
+  @Throttle({ default: { limit: 2, ttl: 60000 } }) // 2 requests per minute for search
+  @Get('search')
+  async searchProducts(@Query('q') query: string) {
+    return this.productService.search(query);
+  }
+}
+```
+
+## 🔐 Password Security
+
+### Password Hashing
+```typescript
+import * as bcrypt from 'bcrypt';
+
+@Injectable()
+export class AuthService {
+  private readonly saltRounds = 12;
+
+  async hashPassword(password: string): Promise<string> {
+    return bcrypt.hash(password, this.saltRounds);
+  }
+
+  async validatePassword(password: string, hashedPassword: string): Promise<boolean> {
+    return bcrypt.compare(password, hashedPassword);
+  }
+
+  async createUser(createUserDto: CreateUserDto): Promise<User> {
+    const hashedPassword = await this.hashPassword(createUserDto.password);
+    
+    return this.prismaService.user.create({
+      data: {
+        ...createUserDto,
+        password: hashedPassword,
+      },
+    });
+  }
+}
+```
+
+## 🛡️ CORS and Security Headers
+
+### Security Configuration
+```typescript
+// main.ts
+import helmet from 'helmet';
+
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule);
+
+  // Security headers
+  app.use(helmet({
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        styleSrc: ["'self'", "'unsafe-inline'"],
+        scriptSrc: ["'self'"],
+        imgSrc: ["'self'", "data:", "https:"],
+      },
+    },
+  }));
+
+  // CORS configuration
+  app.enableCors({
+    origin: process.env.ALLOWED_ORIGINS?.split(',') || ['http://localhost:3000'],
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    credentials: true,
+  });
+
+  await app.listen(3000);
+}
+```
+
+## 🔍 Security Logging
+
+### Security Event Logging
+```typescript
+@Injectable()
+export class SecurityService {
+  constructor(private readonly logger: AppLogger) {
+    this.logger.setContext('SecurityService');
+  }
+
+  logAuthenticationAttempt(email: string, success: boolean, ip: string) {
+    this.logger.log({
+      event: 'authentication_attempt',
+      email,
+      success,
+      ip,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  logAuthorizationFailure(userId: string, resource: string, action: string) {
+    this.logger.warn({
+      event: 'authorization_failure',
+      userId,
+      resource,
+      action,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  logSuspiciousActivity(userId: string, activity: string, details: any) {
+    this.logger.error({
+      event: 'suspicious_activity',
+      userId,
+      activity,
+      details,
+      timestamp: new Date().toISOString(),
+    });
+  }
+}
+```
+
+This ensures comprehensive security with proper authentication, authorization, multi-tenancy, input validation, and security monitoring throughout the application.
