@@ -68,7 +68,7 @@ async function bootstrap() {
     // Configure CORS with credentials support
     const corsOrigin =
       nodeEnv === 'production'
-        ? ['https://allmart.fashion', 'https://admin.allmart.fashion']
+        ? ['https://naarico.com', 'https://admin.naarico.com']
         : true;
     app.enableCors({
       origin: corsOrigin,

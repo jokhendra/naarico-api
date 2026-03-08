@@ -270,7 +270,7 @@ async function ensureDefaultSellerAndStore() {
     const hashedPassword = await bcrypt.hash('Admin@1234', 12);
     admin = await prisma.user.create({
       data: {
-        email: 'admin@allmart.fashion',
+        email: 'admin@naarico.com',
         password: hashedPassword,
         firstName: 'Admin',
         lastName: 'User',
@@ -283,15 +283,15 @@ async function ensureDefaultSellerAndStore() {
   }
 
   // Find or create default store for admin
-  const storeSlug = 'allmart-official-store';
+  const storeSlug = 'naarico-official-store';
   let store = await prisma.store.findUnique({ where: { slug: storeSlug } });
 
   if (!store) {
     store = await prisma.store.create({
       data: {
-        name: 'AllMart Official Store',
+        name: 'Naarico Official Store',
         slug: storeSlug,
-        description: 'Official AllMart marketplace store',
+        description: 'Official Naarico – Suits & Sarees store',
         sellerId: admin.id,
         status: 'APPROVED',
         isActive: true,
